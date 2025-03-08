@@ -52,7 +52,7 @@ class Lichess_Game:
         self.out_of_chessdb_counter = 0
         self.move_overhead = self._get_move_overhead(config.engines[engine_key])
         self.engine = engine
-        self.scores: list[chess.engine.PovScore | None] = []
+        self.scores: list[chess.engine.PovScore] = []
         self.last_message = 'No eval available yet.'
         self.last_pv: list[chess.Move] = []
 
@@ -142,12 +142,11 @@ class Lichess_Game:
         else:
             move, info = await self.engine.make_move(self.board, *self.engine_times)
 
-            self.scores.append(info.get('score'))
+            if 'score' in info:
+                self.scores.append(info['score'])
             message = f'Engine:  {self._format_move(move):14} {self._format_engine_info(info)}'
             move_response = Move_Response(move, message,
                                           pv=info.get('pv', []),
-                                          is_drawish=self._is_draw_eval(),
-                                          is_resignable=self._is_resign_eval(),
                                           is_engine_move=len(self.board.move_stack) > 1)
 
         self.board.push(move_response.move)
@@ -158,9 +157,7 @@ class Lichess_Game:
         self.last_message = move_response.public_message
         self.last_pv = move_response.pv
 
-        return Lichess_Move(move_response.move.uci(),
-                            self._offer_draw(move_response.is_drawish),
-                            self._resign(move_response.is_resignable))
+        return Lichess_Move(move_response.move.uci(), self._offer_draw(move_response), self._resign(move_response))
 
     def update(self, gameState_event: dict[str, Any]) -> None:
         moves = gameState_event['moves'].split()
@@ -193,14 +190,14 @@ class Lichess_Game:
             if self.white_time > self.move_overhead:
                 white_time = self.white_time - self.move_overhead
             else:
-                white_time = self.white_time / 2
+                white_time = self.white_time / 2.0
 
             return white_time, self.black_time, self.increment
 
         if self.black_time > self.move_overhead:
             black_time = self.black_time - self.move_overhead
         else:
-            black_time = self.black_time / 2
+            black_time = self.black_time / 2.0
 
         return self.white_time, black_time, self.increment
 
@@ -219,68 +216,50 @@ class Lichess_Game:
         if self.gaviota_tablebase:
             self.gaviota_tablebase.close()
 
-    def _is_draw_eval(self) -> bool:
-        if not self.config.offer_draw.enabled:
-            return False
-
-        too_shallow = self.board.fullmove_number < self.config.offer_draw.min_game_length
-        too_few_scores = len(self.scores) < self.config.offer_draw.consecutive_moves
-
-        if too_shallow or too_few_scores:
-            return False
-
-        for score in islice(self.scores, len(self.scores) - self.config.offer_draw.consecutive_moves, None):
-            if score is None:
-                return False
-
-            if abs(score.relative.score(mate_score=40000)) > self.config.offer_draw.score:
-                return False
-
-        return True
-
-    def _offer_draw(self, is_drawish: bool) -> bool:
-        if not is_drawish:
-            return False
-
+    def _offer_draw(self, move_response: Move_Response) -> bool:
         if not self.config.offer_draw.enabled:
             return False
 
         if not self.engine.opponent.is_engine and not self.config.offer_draw.against_humans:
             return False
 
-        if not self.increment and self.opponent_time < 30.0:
+        if not self.increment and self.opponent_time < 10.0:
             return False
 
-        return True
+        if not move_response.is_engine_move:
+            return move_response.is_drawish
 
-    def _is_resign_eval(self) -> bool:
-        if not self.config.resign.enabled:
+        if self.board.fullmove_number < self.config.offer_draw.min_game_length:
             return False
 
-        if len(self.scores) < self.config.resign.consecutive_moves:
+        if len(self.scores) < self.config.offer_draw.consecutive_moves:
             return False
 
-        for score in islice(self.scores, len(self.scores) - self.config.resign.consecutive_moves, None):
-            if score is None:
-                return False
-
-            if score.relative.score(mate_score=40000) > self.config.resign.score:
+        for score in islice(self.scores, len(self.scores) - self.config.offer_draw.consecutive_moves, None):
+            if abs(score.relative.score(mate_score=40_000)) > self.config.offer_draw.score:
                 return False
 
         return True
 
-    def _resign(self, is_resignable: bool) -> bool:
-        if not is_resignable:
-            return False
-
+    def _resign(self, move_response: Move_Response) -> bool:
         if not self.config.resign.enabled:
             return False
 
         if not self.engine.opponent.is_engine and not self.config.resign.against_humans:
             return False
 
-        if not self.increment and self.opponent_time < 30.0:
+        if not self.increment and self.opponent_time < 10.0:
             return False
+
+        if not move_response.is_engine_move:
+            return move_response.is_resignable
+
+        if len(self.scores) < self.config.resign.consecutive_moves:
+            return False
+
+        for score in islice(self.scores, len(self.scores) - self.config.resign.consecutive_moves, None):
+            if score.relative.score(mate_score=40_000) > self.config.resign.score:
+                return False
 
         return True
 
@@ -926,8 +905,8 @@ class Lichess_Game:
         return board.is_repetition(count=2)
 
     def _has_mate_score(self) -> bool:
-        for score in filter(None, reversed(self.scores)):
-            mate = score.relative.mate()
-            return mate is not None and mate > 0
+        if not self.scores:
+            return False
 
-        return False
+        mate = self.scores[-1].relative.mate()
+        return mate is not None and mate > 0
