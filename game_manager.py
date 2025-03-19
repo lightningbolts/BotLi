@@ -64,11 +64,11 @@ class Game_Manager:
             while tournament := self._get_next_tournament_to_join():
                 await self._join_tournament(tournament)
 
-            while challenge_request := self._get_next_challenge_request():
-                await self._create_challenge(challenge_request)
-
             while challenge := self._get_next_challenge():
                 await self._accept_challenge(challenge)
+
+            while challenge_request := self._get_next_challenge_request():
+                await self._create_challenge(challenge_request)
 
         for tournament in self.unstarted_tournaments.values():
             tournament.cancel()
@@ -82,9 +82,7 @@ class Game_Manager:
 
     @property
     def is_busy(self) -> bool:
-        return (len(self.tasks) +
-                len(self.tournaments) +
-                self.reserved_game_spots) >= self.config.challenge.concurrency
+        return len(self.tasks) + len(self.tournaments) + self.reserved_game_spots >= self.config.challenge.concurrency
 
     def add_challenge(self, challenge: Challenge) -> None:
         if challenge not in self.open_challenges:
@@ -137,7 +135,9 @@ class Game_Manager:
             return
 
         tournament_info = await self.api.get_tournament_info(tournament_request.id_)
-        tournament = Tournament.from_tournament_info(tournament_info, tournament_request)
+        tournament = Tournament.from_tournament_info(tournament_info)
+        tournament.team = tournament_request.team
+        tournament.password = tournament_request.password
 
         if not tournament.bots_allowed:
             print(f'BOTs are not allowed in tournament "{tournament.name}".')
@@ -214,6 +214,13 @@ class Game_Manager:
     async def _start_game(self, game_event: dict[str, Any]) -> None:
         if self.reserved_game_spots > 0:
             self.reserved_game_spots -= 1
+
+        if 'tournamentId' in game_event and game_event['tournamentId'] not in self.tournaments:
+            tournament_info = await self.api.get_tournament_info(game_event['tournamentId'])
+            tournament = Tournament.from_tournament_info(tournament_info)
+            tournament.end_task = asyncio.create_task(self._tournament_end_task(tournament))
+            self.tournaments[tournament.id_] = tournament
+            print(f'External joined tournament "{tournament.name}" detected.')
 
         game = Game(self.api, self.config, self.username, game_event['id'])
         task = asyncio.create_task(game.run())
